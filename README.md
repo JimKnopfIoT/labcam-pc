@@ -16,6 +16,16 @@ This repository bundles four small, independent components:
 
 ---
 
+<p align="center">
+<img src="1.jpg" width="150"> 
+<img src="2.jpg" width="150"> 
+<img src="3.jpg" width="150">
+<img src="4.jpg" width="150">
+</p>
+
+---
+
+
 ## ⚠️ Status & security notice
 
 This is a **proof-of-concept (POC) / work-in-progress (WIP)**, shared for interest
