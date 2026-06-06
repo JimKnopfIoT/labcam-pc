@@ -1,0 +1,21 @@
+# Secrets -- NEVER commit
+.env
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Editor/OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Test/sample images (large binaries) -- force-add individually if needed
+testdata/*.jpg
+testdata/*.png
