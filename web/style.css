@@ -1,0 +1,149 @@
+:root {
+  --bg-panel: rgba(26,26,26,0.62);   /* another 10% less transparent (darker) */
+  --card-bg:  rgba(33,33,33,0.6);    /* 10% less transparent */
+  --v: #00d3ff;   /* voltage */
+  --a: #e4b700;   /* current */
+  --mode: #64ff00;
+  --label: #00d3ff;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden;
+  font-family: "Roboto Mono","Consolas","Menlo","Courier New",monospace; color: #fff;
+  -webkit-user-select: none; user-select: none; }
+
+#video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+#micro { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; display: none; }
+#cv { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+/* ---- Top: instrument bar (left) + component-ID column (right) ---- */
+#top { position: absolute; top: 6px; left: 6px; right: 6px; z-index: 9;
+  display: flex; gap: 6px; justify-content: flex-end; align-items: flex-start;
+  pointer-events: none; flex-wrap: nowrap; }
+#bar { display: flex; gap: 6px; flex-wrap: nowrap; min-width: 0; pointer-events: none; }
+#bar.off { display: none; }
+
+/* Component ID: control panel (instrument field size) + result-text panel of the same width below */
+#idcol { display: flex; flex-direction: column; gap: 6px; width: 172px; flex: 0 0 auto;
+  pointer-events: auto; }
+/* 3x3 button grid (all buttons equal size). Col1 component ID · Col2 IR · Col3 displays. */
+#idpanel { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; padding: 3px 8px; }   /* 3px instead of .panel-4px -> 2px shorter, equal top/bottom */
+/* Buttons semi-transparent (camera shows through), NO border when inactive. */
+#idpanel button { font: inherit; color: #fff; background: rgba(42,42,42,0.45);
+  border: none; border-radius: 4px; padding: 6px 0; cursor: pointer; font-size: 15px; line-height: 1.1; }
+#idpanel button:hover:not(:disabled) { background: rgba(58,58,58,0.6); }
+#idpanel button:disabled { cursor: default; }   /* same transparency as active buttons (not extra faded) */
+#idpanel button.on { outline: 2px solid var(--v); }   /* active only: blue border */
+#idpanel .lab { grid-column: 1 / -1; }   /* status row spanning full width */
+#idpanel .lab:empty { display: none; }   /* empty -> row+gap removed: idpanel = instrument panel height, buttons 4px top/bottom */
+#status { color: #cfe9ff; font-size: 11px; font-weight: 400; }
+.panel { background: var(--bg-panel); border-radius: 4px; padding: 4px 8px; min-width: 165px;
+  display: flex; flex-direction: column; gap: 1px; }
+.panel .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.panel .rt  { display: flex; align-items: baseline; gap: 8px; }  /* [D+ ...][gap][value] right-aligned */
+.panel .mode { color: var(--mode); font-weight: 700; font-size: 13px; }
+.panel .val  { font-weight: 700; font-size: 18px; }
+.panel .val .u { font-size: 12px; }
+.panel .aux  { color: var(--v); font-size: 11px; }   /* USB D+/D- (label+value) cyan/blue like all V values */
+.panel .aux .u { font-size: 9px; }                   /* small unit symbol (V) */
+.panel .aux:empty { display: none; }
+.panel canvas.g { display: block; width: 100%; height: 33px; margin-top: auto; }
+.panel .lab  { color: var(--label); font-weight: 700; font-size: 12px; margin-top: 2px; }
+.panel.v .val { color: var(--v); }  .panel .v { color: var(--v); }  .panel .a { color: var(--a); }
+.panel.off { opacity: 0.45; }
+.panel .offval { color: #cfcfcf; opacity: 0.5; font-weight: 700; }   /* output off: "Off" grey + semi-transparent */
+.panel .val.shorted { color: #ff453a; }   /* diode short: "Shorted" in red (2nd row) */
+
+/* ---- Selection frame with corner handles ---- */
+#roibox { position: absolute; display: none; z-index: 7; cursor: move; touch-action: none; }
+#roibox.show { display: block; }
+#roibox .h { position: absolute; width: 34px; height: 34px; touch-action: none; }
+#roibox .h.tl { left:-17px; top:-17px; cursor: nwse-resize; }
+#roibox .h.tr { right:-17px; top:-17px; cursor: nesw-resize; }
+#roibox .h.br { right:-17px; bottom:-17px; cursor: nwse-resize; }
+#roibox .h.bl { left:-17px; bottom:-17px; cursor: nesw-resize; }
+/* Like the silhouette corners (canvas): two nested L-shapes from borders —
+   ::before = outer YELLOW L (arm 20px, 4px thick), ::after = inner BLUE L
+   inset by 4px AND shortened at the open ends by 4px (arm 12px), so
+   blue does not bleed into yellow. box-sizing:border-box (global) -> arm = border-box edge. */
+#roibox .h::before, #roibox .h::after { content:""; position:absolute; }
+#roibox .h::before { width:20px; height:20px; } #roibox .h::after { width:12px; height:12px; }
+#roibox .h.tl::before{left:17px;top:17px; border-top:4px solid #e4b700; border-left:4px solid #e4b700;}   #roibox .h.tl::after{left:21px;top:21px; border-top:4px solid #00d3ff; border-left:4px solid #00d3ff;}
+#roibox .h.tr::before{right:17px;top:17px; border-top:4px solid #e4b700; border-right:4px solid #e4b700;}  #roibox .h.tr::after{right:21px;top:21px; border-top:4px solid #00d3ff; border-right:4px solid #00d3ff;}
+#roibox .h.br::before{right:17px;bottom:17px; border-bottom:4px solid #e4b700; border-right:4px solid #e4b700;} #roibox .h.br::after{right:21px;bottom:21px; border-bottom:4px solid #00d3ff; border-right:4px solid #00d3ff;}
+#roibox .h.bl::before{left:17px;bottom:17px; border-bottom:4px solid #e4b700; border-left:4px solid #e4b700;}  #roibox .h.bl::after{left:21px;bottom:21px; border-bottom:4px solid #00d3ff; border-left:4px solid #00d3ff;}
+
+/* ---- Result card (panel below the ID control panel, same width) ---- */
+#card { width: 100%; background: var(--card-bg); padding: 6px 8px; line-height: 1.2;
+  pointer-events: auto; overflow-wrap: anywhere; word-break: break-word;
+  max-height: 60vh; overflow-y: auto; }
+#card.hidden { display: none; }
+#card .l1 { font-size: 14px; font-weight: 700; }
+#card .l2, #card .l3, #card .l4 { font-size: 12px; }
+#card .l3 { color: #d0d0d0; } #card .l4 { color: #c0c0c0; }
+#card a.ds { color: #fff; text-decoration: underline; font-size: 12px; }
+
+/* ---- SDS2504X-HD oscilloscope (noVNC) as picture-in-picture bottom-right ----
+   Width = four instrument blocks (--scope-w, 4*165 + 3*6px gap). Only the inner
+   noVNC canvas is shown: the wrapper (overflow:hidden) has the visible size, the
+   iframe loads the full web GUI but is scaled + shifted so only the canvas is inside
+   the wrapper.
+   --scope-cl/--scope-ct = canvas position in the web GUI (px, before scaling),
+   --scope-cw/--scope-ch = canvas size (aspect ratio of the wrapper).
+   ==> Fine-tune these 4 values after the first screenshot. */
+:root {
+  --scope-w:  678;     /* wrapper width = 4 instrument elements (4*165 + 3*6 gap); larger = scope image bigger/more readable */
+  /* Visible GUI region = [cl..cl+cw] x [ct..ct+ch] (GUI px). Higher cl/ct =
+     crop more from top-left; higher cw/ch = show more to the right/bottom (zoom out).
+     Canvas is larger than the 922x560 from markup (noVNC uses the remote resolution). */
+  --scope-cl: 300px;   /* top-left corner stays fixed */
+  --scope-ct: 182px;   /* top-left corner stays fixed */
+  --scope-cw: 924;     /* extended right to canvas right edge (~1233) -> no black */
+  --scope-ch: 554;     /* extended down to canvas bottom edge (~758) -> no black */
+}
+/* HT-301 thermal image (MJPEG) — above the scope, same width (--scope-w), 4:3 (384x288).
+   bottom = scope bottom edge (2) + scope height + 6px gap. */
+/* Stream is ALWAYS 768x576 (4:3). The colorbar is overlaid on the right edge of the stream
+   (no extra column) -> the box is FIXED: same width/position, always reaches the outer edge
+   (right edge = scope/instrument outer edge, left = BB3).
+   Gradient on/off only changes the bar drawn in the image, never the geometry -> no jitter. */
+#irwrap { position: absolute; right: 13px; z-index: 8;   /* left edge = start of 2nd instrument panel (BB3) */
+  bottom: calc(2px + var(--scope-w) * var(--scope-ch) / var(--scope-cw) * 1px + 6px);
+  width: calc(var(--scope-w) * 1px); aspect-ratio: 768 / 576;   /* 4:3, feste Box */
+  overflow: hidden; background: #000; box-shadow: 0 0 0 1px #555; display: none; }
+#irwrap.show { display: block; }
+#irframe { width: 100%; height: 100%; display: block; object-fit: fill; }
+
+#scopewrap { position: absolute; right: 13px; bottom: 2px; z-index: 8;   /* left edge = start of 2nd instrument panel (BB3) */
+  width: calc(var(--scope-w) * 1px); aspect-ratio: var(--scope-cw) / var(--scope-ch);
+  overflow: hidden; background: #000; box-shadow: 0 0 0 1px #555; display: none; }
+#scopewrap.show { display: block; }
+#scopeframe { position: absolute; left: 0; top: 0; width: 1300px; height: 760px; border: 0;
+  transform-origin: top left;
+  /* scale so that canvas width -> wrapper width, then shift canvas corner to 0,0 */
+  transform: translate(calc(-1 * var(--scope-cl) * var(--scope-w) / var(--scope-cw)),
+                       calc(-1 * var(--scope-ct) * var(--scope-w) / var(--scope-cw)))
+             scale(calc(var(--scope-w) / var(--scope-cw))); }
+
+/* Keithley DMM7510 Virtual Front Panel (LXI web) — same width/slot as the scope
+   (right:13 = 2nd instrument panel, bottom:2 = directly below the IR image). The web page
+   (#bumper 1074x430) is loaded into the iframe; only the display canvas is shown.
+   --dmm-cl/ct = canvas corner in page px, --dmm-cw/ch = canvas size (box aspect ratio).
+   ==> Fine-tune these 4 values after the first screenshot (same as for the scope). */
+:root {
+  /* Canvas corner = body margin 8 + bumper border 2 + center(127)/+display pad 3 = ~140 left;
+     top 8 + 2 + GreenLabel(~64) + 3 = ~77. iframe width 1090 = 1074 + 2x8 body margin
+     -> contentWrapper auto-margin 0. ==> Fine-tune these 4 values after the 1st screenshot. */
+  --dmm-cl: 140px;   /* top-left canvas corner (page px, before scaling) */
+  --dmm-ct: 77px;
+  --dmm-cw: 560;     /* canvas width (#Display 560) */
+  --dmm-ch: 336;     /* canvas height (800x480 -> at 560 width exactly 336; no white border at bottom) */
+}
+#dmmwrap { position: absolute; right: 13px; bottom: 2px; z-index: 8;
+  width: calc(var(--scope-w) * 1px); aspect-ratio: var(--dmm-cw) / var(--dmm-ch);
+  overflow: hidden; background: #000; box-shadow: 0 0 0 1px #555; display: none; }
+#dmmwrap.show { display: block; }
+#dmmframe { position: absolute; left: 0; top: 0; width: 1090px; height: 450px; border: 0;
+  transform-origin: top left;
+  transform: translate(calc(-1 * var(--dmm-cl) * var(--scope-w) / var(--dmm-cw)),
+                       calc(-1 * var(--dmm-ct) * var(--scope-w) / var(--dmm-cw)))
+             scale(calc(var(--scope-w) / var(--dmm-cw))); }

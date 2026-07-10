@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab Cam Web — Microscope + Instruments + Component ID</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Live camera: locally (secure context) via getUserMedia into <video>; from another machine
+       on the LAN (plain-HTTP IP, getUserMedia blocked) as a server MJPEG stream into <img>. -->
+  <video id="video" autoplay playsinline muted></video>
+  <img id="micro" alt="Microscope">
+
+  <!-- Silhouette / ROI drawing -->
+  <canvas id="cv"></canvas>
+
+  <!-- Selection frame (component ID) with corner handles -->
+  <div id="roibox">
+    <div class="h tl" data-corner="tl"></div>
+    <div class="h tr" data-corner="tr"></div>
+    <div class="h br" data-corner="br"></div>
+    <div class="h bl" data-corner="bl"></div>
+  </div>
+
+  <!-- Top: instrument bar (left) + component-ID panel with result text (right of KEL) -->
+  <div id="top">
+    <div id="bar"></div>
+    <div id="idcol">
+      <!-- 3x3 grid: col1 = component ID (magnify/identify/clear), col2 = IR (cam/POI/gradient),
+           col3 = displays (instruments/scope/DMM7510). -->
+      <div id="idpanel" class="panel">
+        <button id="btnComp" title="Component identification on/off">🔍</button>
+        <button id="btnIr" title="Thermal image HT-301 on/off">🌡</button>
+        <button id="btnInstr" class="on" title="Instruments on/off">⚙</button>
+
+        <button id="btnId" disabled title="Identify the selected component">❓</button>
+        <button id="btnMarkers" title="IR measurement points (POI) + Min/Max on/off">📍</button>
+        <button id="btnScope" title="Oscilloscope SDS2504X-HD on/off">📈</button>
+
+        <button id="btnClear" title="Clear result text">✕</button>
+        <button id="btnGradient" title="IR color gradient/scale (incl. background) on/off">🌈</button>
+        <button id="btnDmm" title="DMM7510 Virtual Front Panel on/off">📟</button>
+
+        <span id="status" class="lab"></span>
+      </div>
+      <div id="card" class="hidden"></div>
+    </div>
+  </div>
+
+  <!-- HT-301 thermal image (MJPEG from the labcam-thermal service) as picture-in-picture ABOVE the scope (toggle 🌡). -->
+  <div id="irwrap"><img id="irframe" alt="HT-301 thermal image"></div>
+
+  <!-- SDS2504X-HD oscilloscope (noVNC) as picture-in-picture bottom-right (toggle 📈 in the ID panel above).
+       Wrapper clips only the inner noVNC canvas via overflow:hidden (hides the web GUI chrome). -->
+  <div id="scopewrap"><iframe id="scopeframe" title="SDS2504X-HD"></iframe></div>
+
+  <!-- Keithley DMM7510 Virtual Front Panel (LXI web) as picture-in-picture bottom-right (toggle 📟).
+       Same slot as the scope (mutually exclusive). Wrapper crops only the display canvas
+       from the web page via overflow:hidden + transform. -->
+  <div id="dmmwrap"><iframe id="dmmframe" title="DMM7510"></iframe></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

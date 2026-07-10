@@ -1,0 +1,5 @@
+# Phase 2 (Claude integration):
+#   python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+anthropic>=0.40
+# Image downscaling before sending (saves tokens/cost, avoids TPM rate limits)
+pillow>=10
