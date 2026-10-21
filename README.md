@@ -209,6 +209,8 @@ cd web && ./serve.sh               # http://127.0.0.1:8080/
 
 ---
 
+AI assisted development
+
 ## License
 
 * **GPL-3.0-or-later** for this repository — see `LICENSE`.
