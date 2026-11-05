@@ -112,6 +112,16 @@ connects directly by MAC (falls back to the advertised-name prefix) and clears a
 stale BLE link before connecting. Note: the RN4871's UART RX needs a pull-up to
 3.3 V — without it the module streams only `0x00` bytes.
 
+### Disconnecting an instrument
+
+A double click on an instrument's name in the dashboard or phone app disconnects it:
+no queries, no open connection, the panel shows `—` and "disconnected". The clients
+send `{"cmd":"device_connection","device":"dmm|bb3|usb|kel","connected":false}` over
+the WebSocket. The backend keeps the state in
+`instruments-backend/device_connections.json`, so it survives a restart. The DMM7510
+is handed back to its front panel (`:TRIG:CONT REST`), and it is also released while
+its digitize functions are selected, because they cannot be polled.
+
 ### Dashboard endpoints → `web/config.js`
 
 The browser dashboard derives the instrument-backend and component-ID hosts from

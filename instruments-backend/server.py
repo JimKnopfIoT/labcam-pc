@@ -12,9 +12,11 @@ as read-only clients. Device addresses live in config.py (example values below):
   USB tester   BLE (FNB48 family)                            -> "bb3b" (USB output)
 """
 import asyncio
+import copy
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import sys
@@ -67,6 +69,13 @@ DMM_MODE_MAP = {
     "VOLT:DC:RAT":  ("Ratio",  ""),
 }
 
+# :SENS:DIG:FUNC? response -> UI label (the regular function then reads "NONE").
+DMM_DIGITIZE_LABELS = {"VOLT": "Digi V", "CURR": "Digi I"}
+# Closing the connection alone leaves the instrument showing "TCPIP" with its display
+# frozen. This command returns it to local control and restarts continuous measuring.
+DMM_LOCAL_CMD = b":TRIG:CONT REST\n"
+DMM_DIGITIZE_PERIOD = 30.0  # s between short looks at the instrument while it is released
+
 # Per-function: matching range query. Values without a meaningful range (Diode, Freq,
 # Period, Temp, Ratio) are omitted -> frontend then falls back to value magnitude.
 DMM_RANGE_CMD = {
@@ -99,6 +108,7 @@ CLIENTS: set = set()
 # DE-5000 transport selection. Default = wired CP2102; a client can switch to the
 # RN4871 (BLE) at runtime — see _handle_cmd() / de5000_poll().
 LCR_SOURCE = DE5000_SOURCE_DEFAULT
+DEVICE_DEFAULTS = copy.deepcopy(STATE["devices"])
 LCR_SWITCH = asyncio.Event()   # set to make de5000_poll() drop the current transport
 
 
@@ -107,8 +117,34 @@ def log(tag, msg):
 
 
 # ---------- DMM7510 ----------
-async def dmm_poll():
+async def _dmm_return_to_local():
+    """Hand the instrument back to its front panel over a short-lived connection."""
+    writer = None
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(*DMM), timeout=3.0)
+        writer.write(DMM_LOCAL_CMD)
+        await writer.drain()
+        await asyncio.sleep(0.2)
+    except (asyncio.TimeoutError, OSError) as e:
+        log("dmm", f"return to local failed: {type(e).__name__}: {e}")
+    finally:
+        if writer is not None:
+            writer.close()
+
+
+async def _dmm_discard_pending(reader):
+    """The DMM keeps an unread reply across connections: drop it, or every answer
+    on the new connection would be off by one."""
+    try:
+        while await asyncio.wait_for(reader.read(4096), 0.05):
+            pass
+    except asyncio.TimeoutError:
+        pass
+
+
+async def _dmm_session():
     backoff = RECONNECT_BACKOFF
+    released = False    # digitize mode: instrument is left to the front panel
     while True:
         writer = None
         try:
@@ -116,9 +152,11 @@ async def dmm_poll():
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(*DMM), timeout=5.0
             )
-            writer.write(b"*lang scpi;FORMat:ASCii:PRECision MAXimum\n")
-            await writer.drain()
-            await asyncio.sleep(0.2)
+            if not released:
+                writer.write(b"*lang scpi;FORMat:ASCii:PRECision MAXimum\n")
+                await writer.drain()
+                await asyncio.sleep(0.2)
+                await _dmm_discard_pending(reader)
             log("dmm", "connected")
             backoff = RECONNECT_BACKOFF
             while True:
@@ -130,7 +168,11 @@ async def dmm_poll():
                 # never numeric. If func_raw starts with a digit or sign,
                 # the TCP response order has slipped. Flush the buffer
                 # and restart the next round cleanly.
-                if not func_raw or func_raw[0] in "0123456789+-.":
+                # The same goes for anything not shaped like a SCPI function name:
+                # otherwise a slipped text response or error message would be shown
+                # as the DMM mode. Functions missing from DMM_MODE_MAP (e.g. "CONT")
+                # are valid and still pass, displayed under their short raw name.
+                if not re.fullmatch(r"[A-Z][A-Z:]{1,19}", func_raw):
                     log("dmm", f"SCPI desync, discarding: {func_raw[:30]!r}")
                     try:
                         await asyncio.wait_for(reader.readline(), 0.3)
@@ -138,6 +180,35 @@ async def dmm_poll():
                         pass
                     await asyncio.sleep(0.3)
                     continue
+
+                # Digitize active: the regular function reads "NONE" and READ? would only
+                # raise error 2801 on the device and never answer (-> timeout, reconnect).
+                # Digi V / Digi I are operated at the instrument itself, so release it:
+                # report the mode only (ok=False -> frontends show the mode with "—"),
+                # disconnect, and only look briefly now and then whether the mode changed.
+                if func_raw == "NONE":
+                    writer.write(b":SENS:DIG:FUNC?\n")
+                    await writer.drain()
+                    dig_raw = (await asyncio.wait_for(reader.readline(), 2.0)).decode().strip().strip('"')
+                    STATE["devices"]["dmm"] = {
+                        "ok": False, "mode": DMM_DIGITIZE_LABELS.get(dig_raw, "—"),
+                        "value": None, "unit": "", "range": None
+                    }
+                    writer.write(DMM_LOCAL_CMD)
+                    await writer.drain()
+                    await asyncio.sleep(0.2)
+                    writer.close()
+                    await writer.wait_closed()
+                    writer = None
+                    released = True
+                    await asyncio.sleep(DMM_DIGITIZE_PERIOD)
+                    break
+
+                if released:    # back in a normal function: resume regular polling
+                    released = False
+                    writer.write(b"*lang scpi;FORMat:ASCii:PRECision MAXimum\n")
+                    await writer.drain()
+                    await asyncio.sleep(0.2)
 
                 writer.write(b':READ? "defbuffer1",READ\n')
                 await writer.drain()
@@ -158,7 +229,7 @@ async def dmm_poll():
                     except (ValueError, TypeError):
                         rng = None
 
-                label, unit = DMM_MODE_MAP.get(func_raw, (func_raw or "—", ""))
+                label, unit = DMM_MODE_MAP.get(func_raw, (func_raw, ""))
                 try:
                     value = float(val_raw)
                 except (ValueError, TypeError):
@@ -167,6 +238,10 @@ async def dmm_poll():
                     "ok": True, "mode": label, "value": value, "unit": unit, "range": rng
                 }
                 await asyncio.sleep(DMM_PERIOD)
+        except asyncio.CancelledError:      # client disconnected the instrument
+            if writer is not None:
+                writer.close()
+            raise
         except (asyncio.TimeoutError, OSError, ConnectionError) as e:
             STATE["devices"]["dmm"]["ok"] = False
             # On "connection refused/timeout" the device usually still holds the old TCP session
@@ -190,7 +265,7 @@ async def dmm_poll():
 
 
 # ---------- BB3 ----------
-async def bb3_poll():
+async def _bb3_session():
     backoff = RECONNECT_BACKOFF
     while True:
         writer = None
@@ -227,6 +302,10 @@ async def bb3_poll():
                         "ok": True, "mode": mode, "voltage": v, "current": a, "output": output_on
                     }
                 await asyncio.sleep(BB3_PERIOD)
+        except asyncio.CancelledError:      # client disconnected the instrument
+            if writer is not None:
+                writer.close()
+            raise
         except (asyncio.TimeoutError, OSError, ConnectionError) as e:
             STATE["devices"]["bb3a"]["ok"] = False
             STATE["devices"]["bb3b_raw"]["ok"] = False
@@ -249,6 +328,19 @@ async def bb3_poll():
                 except Exception:
                     pass
             await asyncio.sleep(RECONNECT_BACKOFF)
+
+
+# ---------- Fnirsi C1 USB tester (BLE) ----------
+# Protocol from blakelton/FNIRSI-FNB-Web-Server (Android app reverse engineering).
+# Init: enable notifications -> GET_INFO (0x81) -> GET_STATUS (0x85) -> START (0x82).
+# Notifications contain concatenated sub-packets [0xAA][CMD][LEN][DATA...][CRC8].
+# Main data in CMD=0x04: V/I/P as int32-LE x 1/10000.
+# Staleness watchdog: the BLE link can stay "connected" while the tester stops
+# sending notifications. Without these thresholds the panel freezes on the last
+# value forever (looks live, is not).
+C1_STALE_S   = 6.0     # no measurement packet -> device counts as offline
+C1_RESTART_S = 12.0    # ... re-issue START once (maybe it only stopped streaming)
+C1_DEAD_S    = 30.0    # ... give up and rebuild the BLE session
 
 
 # ---------- Fnirsi C1 USB tester (BLE) ----------
@@ -287,26 +379,59 @@ def _c1_protocol(voltage, dp, dn):
     """
     if voltage is None or dp is None or dn is None:
         return "—"
-    # USB-PD by bus voltage (Apple/QC are at 5 V)
-    if 8.5  <= voltage <=  9.5:    return "PD 9V"
-    if 11.5 <= voltage <= 12.5:    return "PD 12V"
-    if 14.5 <= voltage <= 15.5:    return "PD 15V"
-    if 19.5 <= voltage <= 20.5:    return "PD 20V"
+
+    # QC2.0 signals on D+/D- with THREE discrete levels: 0 V, 0.6 V and 3.3 V.
+    # (The old table used a 0.25-0.45 V bucket, which does not exist in the spec, and
+    #  matched 0.6/0.6 -- i.e. an ordinary 5 V source -- as "QC 12V".)
+    def qc_level(v):
+        if v <= 0.35:          return 0
+        if 0.45 <= v <= 0.85:  return 6      # 0.6 V
+        if v >= 2.8:           return 33     # 3.3 V
+        return None
+
+    #                 D+   D-
+    qc = {(6, 0): 5,          # 0.6 / 0     ->  5 V
+          (33, 6): 9,         # 3.3 / 0.6   ->  9 V
+          (6, 6): 12,         # 0.6 / 0.6   -> 12 V
+          (33, 33): 20,       # 3.3 / 3.3   -> 20 V
+          }.get((qc_level(dp), qc_level(dn)))
+
+    # Above 5 V the BUS VOLTAGE decides what was actually negotiated. A QC pattern is only
+    # believable if the rail really sits at that voltage -- reporting "QC 12V" on a 5 V bus
+    # (the old behaviour) is self-contradictory.
+    if voltage > 5.8:
+        for volt, name in ((9, "9V"), (12, "12V"), (15, "15V"), (20, "20V")):
+            if abs(voltage - volt) <= 0.6:
+                # QC2.0 has no 15 V step -> that one is always PD.
+                return f"QC {name}" if (qc == volt and volt != 15) else f"PD {name}"
+        return f"PD {voltage:.1f}V"
+
+    # --- 5 V rail from here on ---
+    # QC may only be claimed if it negotiated 5 V too.
+    if qc == 5:
+        return "QC 5V"
+
+    # A BC1.2 DCP shorts D+ to D-, so both lines sit on the SAME potential -- whatever level
+    # the meter's own pull puts them at. That equality (not the absolute value) is the tell.
+    # Measured on this rig: D+ 0.620 V / D- 0.622 V, i.e. 2 mV apart -> bridged.
+    bridged = abs(dp - dn) < 0.05
     # Apple 2.4A: D+ ~= D- ~= 2.7 V (wider tolerance: 2.3-3.0)
     if 2.3 <= dp <= 3.0 and 2.3 <= dn <= 3.0:
         return "Apple 2.4A"
     # Apple 2.1A: one ~= 2.7 V, the other ~= 2.0 V
     if (2.3 <= dp <= 3.0 and 1.7 <= dn <= 2.2) or (1.7 <= dp <= 2.2 and 2.3 <= dn <= 3.0):
         return "Apple 2.1A"
-    # Apple 1A: D+ ~= D- ~= 2.0 V
-    if 1.7 <= dp <= 2.2 and 1.7 <= dn <= 2.2:
-        return "Apple 1A"
-    # Qualcomm QuickCharge 2.0 (5/9/12 V via D+/D- voltage pattern)
-    if 0.25 <= dp <= 0.45 and 0.25 <= dn <= 0.45:   return "QC 5V"
-    if 0.50 <= dp <= 0.70 and 0.25 <= dn <= 0.45:   return "QC 9V"
-    if 0.50 <= dp <= 0.70 and 0.50 <= dn <= 0.70:   return "QC 12V"
-    # DCP -- D+ ~= D- shorted (~2 V)
-    if abs(dp - dn) < 0.15 and 1.4 <= dp <= 2.3:    return "DCP"
+    # Both lines at ground: no charger signalling at all -> plain host port.
+    if bridged and dp < 0.15:
+        return "SDP 5V"
+    # 2.0 V on BOTH lines is genuinely ambiguous from a pure voltage measurement:
+    # Apple 1A (2.0/2.0 divider) and DCP (bridged) look identical. Both mean "5 V dumb
+    # charger", so label them honestly instead of guessing one.
+    # (The old order had Apple 1A first, which made the DCP branch unreachable anyway.)
+    if bridged and 1.7 <= dp <= 2.2:
+        return "DCP/Apple 1A"
+    if bridged:
+        return "DCP"
     # Fallback: Standard Downstream Port 5 V (SDP)
     if 4.5 <= voltage <= 5.5:                       return "SDP 5V"
     return "—"
@@ -317,7 +442,11 @@ def _c1_parse_notification(data, state):
 
     CMD=0x04 -> V/I/P (int32 LE x 1/10000)
     CMD=0x06 -> D- (uint16 LE), D+ (uint16 LE), both x 1/1000
+
+    Returns True if a measurement packet (0x04) was seen -- the caller uses that
+    as the liveness signal for the staleness watchdog.
     """
+    got_data = False
     i = 0
     while i < len(data):
         if data[i] != 0xAA or i + 2 >= len(data):
@@ -332,6 +461,7 @@ def _c1_parse_notification(data, state):
             v, c, _p = struct.unpack_from("<iii", body, 0)
             state["voltage"] = v / 10000.0
             state["current"] = c / 10000.0
+            got_data = True
         elif cmd == 0x06 and len(body) >= 4:
             dn, dp = struct.unpack_from("<HH", body, 0)
             state["dn"] = dn / 1000.0
@@ -340,6 +470,21 @@ def _c1_parse_notification(data, state):
         # but this keeps the state always consistent
         state["protocol"] = _c1_protocol(state.get("voltage"), state.get("dp"), state.get("dn"))
         i += 3 + length + 1
+    return got_data
+
+
+def _c1_mark_offline(state):
+    """Drop the last reading. The C1 keeps the BLE link up even when it stops
+    streaming (tester switched off / went idle) -- without this the frontends
+    would keep showing the frozen last value as if it were live."""
+    state["ok"] = False
+    state["mode"] = "—"
+    state["voltage"] = None
+    state["current"] = None
+    state["dp"] = None
+    state["dn"] = None
+    state["output"] = None
+    state["protocol"] = "—"
 
 
 async def _c1_force_disconnect():
@@ -357,7 +502,7 @@ async def _c1_force_disconnect():
         pass
 
 
-async def c1_poll():
+async def _c1_session():
     if not _have_bleak:
         log("c1", "bleak not found -- poller disabled. `pip install bleak`")
         return
@@ -374,8 +519,12 @@ async def c1_poll():
             backoff = C1_RECONNECT_BACKOFF
             state = STATE["devices"]["bb3b"]
 
+            live = {"t": time.monotonic()}
+
             def cb(_, data):
-                _c1_parse_notification(bytes(data), state)
+                if not _c1_parse_notification(bytes(data), state):
+                    return          # status/info packet -- no fresh measurement
+                live["t"] = time.monotonic()
                 state["ok"] = True
                 state["mode"] = "USB"
                 state["output"] = True
@@ -388,15 +537,33 @@ async def c1_poll():
             await asyncio.sleep(0.3)
             await client.write_gatt_char(C1_WRITE_U, _c1_build_cmd(C1_CMD_START))
 
+            restarted = False
+
             while client.is_connected:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
+                age = time.monotonic() - live["t"]
+                if age > C1_STALE_S and state["ok"]:
+                    _c1_mark_offline(state)
+                    log("c1", f"no data for {age:.0f}s — marking offline")
+                if age > C1_RESTART_S and not restarted:
+                    restarted = True
+                    try:
+                        await client.write_gatt_char(C1_WRITE_U, _c1_build_cmd(C1_CMD_START))
+                    except Exception:
+                        pass
+                if age > C1_DEAD_S:
+                    log("c1", "stream dead — rebuilding BLE session")
+                    break
+                if age < C1_STALE_S:
+                    restarted = False
             log("c1", "disconnected")
         except Exception as e:
-            STATE["devices"]["bb3b"]["ok"] = False
+            _c1_mark_offline(STATE["devices"]["bb3b"])
             log("c1", f"error: {type(e).__name__}: {e} — retry in {backoff:.1f}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.5, 30.0)
         finally:
+            _c1_mark_offline(STATE["devices"]["bb3b"])
             # Clean disconnect -- STOP + disconnect -- so the C1 does not get
             # stuck in a zombie session.
             if client is not None and client.is_connected:
@@ -447,7 +614,7 @@ def _kel_read_all() -> dict:
     return {"ok": True, "mode": mode, "voltage": v, "current": a, "output": onoff}
 
 
-async def kel_poll():
+async def _kel_session():
     loop = asyncio.get_event_loop()
     while True:
         try:
@@ -656,6 +823,73 @@ async def de5000_poll():
 
 
 # ---------- WebSocket ----------
+# Instruments a client can disconnect (double click on the name in the panel). While
+# disconnected there is no query and no open connection at all.
+DEVICES = {
+    "dmm": {"session": _dmm_session, "keys": ("dmm",), "release": _dmm_return_to_local},
+    "bb3": {"session": _bb3_session, "keys": ("bb3a", "bb3b_raw")},
+    "usb": {"session": _c1_session,  "keys": ("bb3b",), "release": _c1_force_disconnect},
+    "kel": {"session": _kel_session, "keys": ("kel",)},
+}
+# Which devices are disconnected survives a restart: the user may be working at the
+# instrument, and a reboot must not put it back into remote mode.
+DEVICE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_connections.json")
+
+
+def _load_disconnected():
+    try:
+        with open(DEVICE_STATE_FILE) as f:
+            names = json.load(f)["disconnected"]
+        return {name for name in names if name in DEVICES}
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"[devices] ignoring {DEVICE_STATE_FILE}: {type(e).__name__}: {e}", file=sys.stderr)
+        return set()
+
+
+def _save_disconnected():
+    tmp = DEVICE_STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"disconnected": sorted(n for n, d in DEVICES.items() if d["off"])}, f)
+        os.replace(tmp, DEVICE_STATE_FILE)
+    except OSError as e:
+        print(f"[devices] cannot save {DEVICE_STATE_FILE}: {type(e).__name__}: {e}", file=sys.stderr)
+
+
+_disconnected = _load_disconnected()
+for _name, _dev in DEVICES.items():
+    _dev["off"] = _name in _disconnected
+    _dev["wake"] = asyncio.Event()
+
+
+async def device_supervisor(name):
+    """Runs the device's session unless a client asked to disconnect it."""
+    dev = DEVICES[name]
+    while True:
+        dev["wake"].clear()
+        for key in dev["keys"]:
+            STATE["devices"][key] = copy.deepcopy(DEVICE_DEFAULTS[key])
+            if dev["off"]:
+                STATE["devices"][key]["disconnected"] = True
+        if dev["off"]:
+            await dev["wake"].wait()
+            continue
+        session = asyncio.create_task(dev["session"]())
+        await dev["wake"].wait()
+        session.cancel()
+        try:
+            await session
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log(name, f"session ended: {type(e).__name__}: {e}")
+        if dev["off"] and "release" in dev:
+            await dev["release"]()
+
+
+# ---------- WebSocket ----------
 def _handle_cmd(msg):
     """Client -> backend command. Currently: switch the DE-5000 transport source."""
     global LCR_SOURCE
@@ -663,6 +897,17 @@ def _handle_cmd(msg):
         obj = json.loads(msg)
     except (ValueError, TypeError):
         return
+    # States the wanted result instead of toggling, so a double click on PC and phone
+    # at the same time cannot undo itself.
+    if (obj.get("cmd") == "device_connection" and obj.get("device") in DEVICES
+            and isinstance(obj.get("connected"), bool)):
+        dev = DEVICES[obj["device"]]
+        off = not obj["connected"]
+        if dev["off"] != off:
+            dev["off"] = off
+            log(obj["device"], f"disconnected={off} (client request)")
+            _save_disconnected()
+            dev["wake"].set()
     if obj.get("cmd") == "lcr_source":
         val = obj.get("value")
         if val == "toggle":
@@ -702,10 +947,7 @@ async def main():
     log("ws", f"serving on ws://{WS_HOST}:{WS_PORT}")
     async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
         await asyncio.gather(
-            dmm_poll(),
-            bb3_poll(),
-            kel_poll(),
-            c1_poll(),
+            *(device_supervisor(name) for name in DEVICES),
             de5000_poll(),
             broadcaster(),
         )
