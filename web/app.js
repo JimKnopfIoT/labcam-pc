@@ -40,10 +40,24 @@
   let lastState = null;
 
   // =====================================================================
+  //  DMM formatting
+  // =====================================================================
+  // Overflow/"OL": SCPI sentinel (9.9e37) or +/-Infinity. NOT null, which means
+  // "no value" (instrument offline) and stays "—".
+  const OVERLOAD_LIMIT = 1e30;
+  function isOverload(v) {
+    if (v == null || typeof v !== "number") return false;
+    return !isFinite(v) || Math.abs(v) >= OVERLOAD_LIMIT;
+  }
+
+  // =====================================================================
   //  DMM formatting (ported from the instrument STATE backend / LabCam overlay)
   // =====================================================================
   function fmtDmm(value, baseUnit, mode, range) {
-    if (value === null || value === undefined || !isFinite(value) || Math.abs(value) > 1e30)
+    // Overflow (open test leads / range exceeded): the DMM7510 reports
+    // 9.9e37 and shows "OL" itself, which is what we show as well.
+    if (isOverload(value)) return { sign: "", num: "OL", unit: "", overload: true };
+    if (value === null || value === undefined || !isFinite(value))
       return { sign: "", num: "", unit: baseUnit || "" };
     const abs = Math.abs(value); let scaled = value, unit = baseUnit || "", fixed = null;
     if (mode === "Diode") {
@@ -126,6 +140,7 @@
   function dmmYMax(value, mode, range) {
     if (mode === "Diode") return 12;
     if (range != null && isFinite(range) && Math.abs(range) > 0) return Math.abs(range) * 1.2;
+    if (isOverload(value)) return 1.2;
     if (value == null || !isFinite(value)) return 1.2;
     const abs = Math.abs(value); if (abs < 1e-12) return 1.2;
     return Math.pow(10, Math.ceil(Math.log10(abs))) * 1.2;
@@ -144,17 +159,52 @@
     return maxR === null ? currentRange : maxR;
   }
 
+  // Compact scale number with engineering prefix: 12000000 -> "12M", 0.0216 -> "21.6m".
+  function fmtAxis(v) {
+    if (v == null || !isFinite(v)) return "";
+    const a = Math.abs(v);
+    if (a < 1e-12) return "0";
+    const PFX = [[1e9, "G"], [1e6, "M"], [1e3, "k"], [1, ""], [1e-3, "m"], [1e-6, "µ"], [1e-9, "n"]];
+    for (const [p, sfx] of PFX) {
+      if (a >= p) {
+        const n = v / p;
+        let t = (Math.abs(n) >= 10) ? n.toFixed(0) : n.toFixed(1);
+        if (t.endsWith(".0")) t = t.slice(0, -2);
+        return t + sfx;
+      }
+    }
+    return v.toExponential(0);
+  }
+
   function makeGraph(canvas, opts) {
     return {
       canvas, ctx: canvas.getContext("2d"),
       colors: opts.colors, mpp: opts.mpp,
       minValue: opts.min, maxValue: opts.max,   // max undefined => Auto
       autoMax: !!opts.autoMax,                  // lower bound fixed (min), only max auto
+      perSeries: !!opts.perSeries,              // own scale + own band per series
+      units: opts.units || [],                  // base unit per series ("V", "A", "Ohm" ...)
+      axisFont: opts.axisFont || 10,            // font size of the scale numbers
+      solo: -1,                                 // -1 = all series, otherwise only this one
       series: [],
       append(i, t, v) {
         while (this.series.length <= i) this.series.push([]);
         if (v == null || !isFinite(v)) return;
         this.series[i].push({ t, v });
+      },
+      // Mark a gap (DMM in overflow "OL", instrument off/offline): the trace is
+      // interrupted instead of being drawn across the missing period.
+      appendGap(i, t) {
+        while (this.series.length <= i) this.series.push([]);
+        const arr = this.series[i];
+        if (arr.length && arr[arr.length - 1].v === null) return;
+        arr.push({ t, v: null });
+      },
+      // all -> series 0 (V) -> series 1 (A) -> all
+      toggleSolo() {
+        const n = this.colors.length;
+        if (n < 2) return;
+        this.solo = (this.solo >= n - 1) ? -1 : this.solo + 1;
       },
     };
   }
@@ -175,33 +225,101 @@
       while (cut < arr.length - 1 && (now - arr[cut].t) > maxAge) cut++;
       if (cut > 0) g.series[s] = arr.slice(cut);
     }
-    // Scale
-    let lo = g.minValue || 0, hi = g.maxValue;
-    if (g.autoMax) {
-      // Lower bound fixed (lo), max derived from data -> 0 stays at bottom, not center.
-      hi = -Infinity;
-      for (const arr of g.series) for (const p of arr) if (p.v > hi) hi = p.v;
-      if (!isFinite(hi) || hi <= lo) hi = lo + 1;
-      hi = lo + (hi - lo) * 1.08;
-    } else if (g.maxValue == null || isNaN(g.maxValue)) {
-      // Full auto (symmetric around the data)
-      lo = Infinity; hi = -Infinity;
-      for (const arr of g.series) for (const p of arr) { if (p.v < lo) lo = p.v; if (p.v > hi) hi = p.v; }
-      if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
-      if (lo === hi) { lo -= 0.5; hi += 0.5; }
-      const mid = (lo + hi) / 2, half = (hi - lo) / 2 * 1.08; lo = mid - half; hi = mid + half;
-    }
-    const span = (hi - lo) || 1;
-    const yPix = (v) => h - ((v - lo) / span) * h;
+    // --- Scale (same as ScrollGraph.qml) ---
+    const solo = g.solo >= 0;
+    const bounds = (i) => {
+      let mn = Infinity, mx = -Infinity;
+      for (const p of g.series[i] || []) { if (p.v == null) continue; if (p.v < mn) mn = p.v; if (p.v > mx) mx = p.v; }
+      return { mn, mx };
+    };
+    // Auto scale with zero at the bottom (the natural reading for V/A/Ohm).
+    const zeroBased = (mn, mx) => {
+      if (!isFinite(mn) || !isFinite(mx)) return { lo: 0, hi: 1 };
+      const lo = Math.min(0, mn);
+      return { lo, hi: (mx > lo) ? lo + (mx - lo) * 1.08 : lo + 1 };
+    };
+    let shared = null;
+    const scaleOf = (i) => {
+      if (solo || g.perSeries) { const b = bounds(i); return zeroBased(b.mn, b.mx); }
+      if (shared) return shared;
+      // Scale
+      let lo = g.minValue || 0, hi = g.maxValue;
+      if (g.autoMax) {
+        // Lower bound fixed (lo), max derived from data -> 0 stays at bottom, not center.
+        hi = -Infinity;
+        for (const arr of g.series) for (const p of arr) if (p.v != null && p.v > hi) hi = p.v;
+        if (!isFinite(hi) || hi <= lo) hi = lo + 1;
+        hi = lo + (hi - lo) * 1.08;
+      } else if (g.maxValue == null || isNaN(g.maxValue)) {
+        // Full auto (symmetric around the data)
+        lo = Infinity; hi = -Infinity;
+        for (const arr of g.series) for (const p of arr) { if (p.v == null) continue; if (p.v < lo) lo = p.v; if (p.v > hi) hi = p.v; }
+        if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+        if (lo === hi) { lo -= 0.5; hi += 0.5; }
+        const mid = (lo + hi) / 2, half = (hi - lo) / 2 * 1.08; lo = mid - half; hi = mid + half;
+      }
+      shared = { lo, hi };
+      return shared;
+    };
+    // Bands: without perSeries full height, otherwise a FIXED horizontal band per series
+    // (V on top, A below), in solo mode too, so the trace does not move when switching.
+    // Without bands two constant values would lie exactly on top of each other.
+    const bandCount = !g.perSeries ? 1 : Math.max(1, g.colors.length);
+    const bandH = h / bandCount;
+    const inset = Math.min(GLW, bandH / 4);
+    // Clamp y: a single outlier otherwise produces coordinates around 1e33,
+    // the rasterizer then discards the WHOLE path and the trace disappears.
+    const yPix = (sc, band, v) => {
+      const span = (sc.hi - sc.lo) || 1;
+      const y = (band * bandH + bandH - inset) - ((v - sc.lo) / span) * Math.max(1, bandH - 2 * inset);
+      return Math.max(-h, Math.min(2 * h, y));
+    };
+    // --- Keep the right-hand strip free for the scale ---
+    // Readability over completeness: if two numbers do not fit into a band, only the
+    // upper scale end is shown (the scale is always zero-based, so the bottom is 0).
+    const bothLabels = bandH >= 2.3 * g.axisFont;
+    const axisFont = bothLabels ? g.axisFont : Math.max(6, Math.min(g.axisFont, bandH * 0.8));
+    ctx.font = axisFont + "px system-ui, sans-serif";
+    const labels = [];
+    let axisW = 0;
     for (let s = 0; s < g.series.length; s++) {
+      if ((solo && s !== g.solo) || g.series[s].length < 1) { labels.push(null); continue; }
+      const sc = scaleOf(s), u = g.units[s] || "";
+      const lab = { top: fmtAxis(sc.hi) + u, bot: bothLabels ? fmtAxis(sc.lo) : "" };
+      labels.push(lab);
+      axisW = Math.max(axisW, ctx.measureText(lab.top).width, ctx.measureText(lab.bot).width);
+    }
+    if (axisW > 0) axisW = Math.min(axisW + 6, w * 0.4);
+    const plotW = w - axisW;
+
+    for (let s = 0; s < g.series.length; s++) {
+      if (solo && s !== g.solo) continue;
       const arr = g.series[s]; if (arr.length < 1) continue;
+      const sc = scaleOf(s), band = bandCount > 1 ? s : 0;
       ctx.strokeStyle = g.colors[s] || "#fff"; ctx.lineWidth = GLW; ctx.lineJoin = "round";
       ctx.beginPath(); let started = false;
       for (const p of arr) {
-        const x = w - (now - p.t) / g.mpp, y = yPix(p.v);
+        if (p.v == null) { started = false; continue; }     // gap
+        const x = plotW - (now - p.t) / g.mpp, y = yPix(sc, band, p.v);
         if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       }
       ctx.stroke();
+    }
+
+    // Label the scale ends on the right (colour = series colour)
+    if (axisW > 0) {
+      ctx.textAlign = "right";
+      for (let s = 0; s < labels.length; s++) {
+        if (!labels[s]) continue;
+        const bTop = (bandCount > 1 ? s : 0) * bandH;
+        ctx.fillStyle = g.colors[s] || "#fff";
+        ctx.textBaseline = "top";
+        ctx.fillText(labels[s].top, w - 3, bTop + 1);
+        if (labels[s].bot) {
+          ctx.textBaseline = "bottom";
+          ctx.fillText(labels[s].bot, w - 3, bTop + bandH - 1);
+        }
+      }
     }
   }
   function sizeGraphs() {
@@ -215,7 +333,34 @@
   function paintGraphs() { if (instrOn) for (const id in GRAPHS) paintGraph(GRAPHS[id]); }
 
   // =====================================================================
-  //  Instrument-Overlay (DOM)
+  //  Instrument overlay (DOM)
+  // =====================================================================
+  // BB3 channel selection for the PSU panel. The backend polls BOTH channels anyway
+  // (STATE: "bb3a" = CH1, "bb3b_raw" = CH2), so switching is purely client-side, causes
+  // no extra SCPI traffic and needs no command to the backend.
+  // The panel ID ALWAYS stays "bb3a" (DOM/graph); only the data source changes.
+  let bb3Ch = (localStorage.getItem("bb3_ch") === "2") ? 2 : 1;
+  const bb3Src = () => (bb3Ch === 2 ? "bb3b_raw" : "bb3a");
+  // Graph scale per channel: CH1 keeps the configured fixed scale (0..20 V). CH2 may run
+  // higher and would be cut off at the top -> autoMax (lower limit stays 0).
+  function applyBb3Scale() {
+    const g = GRAPHS.bb3a; if (!g) return;
+    g.autoMax = (bb3Ch === 2);
+    g.minValue = CHARTS.bb3a.min;
+    g.maxValue = (bb3Ch === 2) ? undefined : CHARTS.bb3a.max;
+  }
+  function setBb3Ch(ch) {
+    if (ch === bb3Ch) return;
+    bb3Ch = ch;
+    try { localStorage.setItem("bb3_ch", String(ch)); } catch (e) {}
+    // Clear the graph: two channels in ONE trace would be misleading.
+    const g = GRAPHS.bb3a; if (g) g.series = [];
+    applyBb3Scale();
+    if (lastState) renderState(lastState);   // switch now, not at the next STATE
+  }
+
+  // =====================================================================
+  //  Instrument overlay (DOM)
   // =====================================================================
   const PANELS = [
     { id: "dmm",  label: "DMM7510" },
@@ -236,23 +381,68 @@
         '<canvas class="g"></canvas>' +
         '<div class="lab">' + p.label + '</div>';
       bar.appendChild(el);
-      if (p.id === "lcr") {            // Initial placeholder; renderState() fills it once STATE arrives.
+      if (p.id === "bb3a") {           // Double click on the panel switches BB3 Ch1 <-> Ch2.
+        el.style.cursor = "pointer";
+        el.title = "Double click: switch BB3 channel (Ch1 ⇄ Ch2)";
+        el.addEventListener("dblclick", () => setBb3Ch(bb3Ch === 1 ? 2 : 1));
+      }
+      const connDevice = { dmm: "dmm", bb3a: "bb3", bb3b: "usb", kel: "kel" }[p.id];
+      if (connDevice) {                // Double click on the name disconnects the instrument (no queries, no connection).
+        const lab = el.querySelector(".lab");
+        lab.style.pointerEvents = "auto";   // #bar lets clicks through otherwise
+        lab.style.cursor = "pointer";
+        lab.style.userSelect = "none";
+        lab.title = "Double click: disconnect / reconnect the instrument";
+        lab.addEventListener("dblclick", (ev) => {
+          ev.stopPropagation();        // do not switch the BB3 channel as well
+          const cur = lastState && lastState.devices && lastState.devices[p.id];
+          if (cur) sendCmd({ cmd: "device_connection", device: connDevice, connected: !!cur.disconnected });
+        });
+      }
+      if (p.id === "lcr") {            // Placeholder at first; renderState() fills it once STATE arrives.
         el.querySelector(".mode").textContent = "LCR";
         el.querySelector(".val.v").textContent = "—";
         el.querySelector(".r2").style.display = "none";
         el.classList.add("off");
         // Click on the name toggles the source CP2102 <-> RN4871 (BLE).
         const lab = el.querySelector(".lab");
+        lab.style.pointerEvents = "auto";   // see above: #bar lets clicks through otherwise
         lab.style.cursor = "pointer";
         lab.title = "Toggle source: CP2102 ⇄ RN4871 (BLE)";
         lab.onclick = () => sendCmd({ cmd: "lcr_source", value: "toggle" });
       }
       const cfg = CHARTS[p.id];
-      GRAPHS[p.id] = makeGraph(el.querySelector("canvas.g"), {
+      const cnv = el.querySelector("canvas.g");
+      GRAPHS[p.id] = makeGraph(cnv, {
         colors: p.id === "dmm" ? [GCOL.v] : [GCOL.v, GCOL.a],
         mpp: cfg.mpp, min: cfg.min, max: cfg.max, autoMax: p.id === "kel",
+        // V and A each get their own scale + band (the DMM keeps its range-coupled scale).
+        perSeries: p.id !== "dmm" && p.id !== "lcr",
+        // Units of the scale numbers; DMM/LCR change at runtime (see renderState).
+        units: (p.id === "dmm" || p.id === "lcr") ? [""] : ["V", "A"],
       });
+      // A click ONLY on the graph switches the trace: both -> V -> A -> both.
+      // Solo uses its own scale, otherwise the current would vanish at the bottom edge.
+      // (DMM/LCR have only one series -> toggleSolo() does nothing there.)
+      if (p.id !== "dmm" && p.id !== "lcr") {
+        const g = GRAPHS[p.id];
+        const soloName = () => (g.solo < 0 ? "V + A" : (g.solo === 0 ? "V only" : "A only"));
+        // #bar has pointer-events:none (clicks should reach the camera/ROI); turn them back on
+        // for the graph area, otherwise a real mouse never reaches it.
+        cnv.style.pointerEvents = "auto";
+        cnv.style.cursor = "pointer";
+        cnv.title = "Click: switch trace (V + A / V only / A only)";
+        cnv.addEventListener("click", (ev) => {
+          ev.stopPropagation();          // do not pass on as a panel click
+          g.toggleSolo();
+          cnv.title = "Trace: " + soloName() + " — click to switch";
+          paintGraph(g);
+        });
+        // A double click on the panel (BB3 channel) must NOT be triggered from the graph.
+        cnv.addEventListener("dblclick", (ev) => ev.stopPropagation());
+      }
     }
+    applyBb3Scale();   // apply the remembered channel (localStorage) to the new graph instance
     sizeGraphs();
   }
   function devOK(el, ok) { el.classList.toggle("off", !ok); }
@@ -262,6 +452,7 @@
     if (d.dmm) {
       const s = d.dmm, el = $("p-dmm"); devOK(el, s.ok);
       el.querySelector(".mode").textContent = s.mode || "—";
+      el.querySelector(".lab").textContent = "DMM7510" + (s.disconnected ? "  disconnected" : "");
       // Offline (ok:false) => "—". The BLE backends (USB/DE-5000) keep their last reading
       // in the payload even when ok:false — without this gate stale values would remain.
       el.querySelector(".val.v").innerHTML = s.ok ? valHtml(fmtDmm(s.value, s.unit || "", s.mode, s.range)) : valHtml({ sign: "", num: "—", unit: "" });
@@ -276,13 +467,26 @@
       av.classList.toggle("shorted", isShorted);
       lastDmm = s.ok ? s : null;
       const g = GRAPHS.dmm;
-      if (g && s.ok && s.value != null && isFinite(s.value)) {
+      // Do NOT feed the overflow sentinel (9.9e37) into the graph: it blows up any
+      // scale and the rasterizer then discards the whole path. Insert a gap instead.
+      if (g && s.ok && s.value != null && isFinite(s.value) && !isOverload(s.value)) {
+        g.units = [s.unit || ""];       // base unit; fmtAxis adds the prefix
         g.append(0, Date.now(), s.value);
         g.minValue = 0; g.maxValue = dmmYMax(s.value, s.mode, dmmEffectiveRange(s.range, s.mode));
+      } else if (g) {
+        g.appendGap(0, Date.now());
+        // During overflow ("OL") the scale stays on the instrument range too, so the axis
+        // label stays right (otherwise the last value freezes as "12" without a unit).
+        if (s.ok) {
+          g.units = [s.unit || ""];
+          g.minValue = 0; g.maxValue = dmmYMax(null, s.mode, dmmEffectiveRange(s.range, s.mode));
+        }
       }
     }
     for (const id of ["bb3a", "bb3b", "kel"]) {
-      const s = d[id]; if (!s) continue; const el = $("p-" + id); devOK(el, s.ok);
+      // Panel "bb3a" shows CH1 ("bb3a") or CH2 ("bb3b_raw") depending on the selection.
+      const s = d[id === "bb3a" ? bb3Src() : id]; if (!s) continue;
+      const el = $("p-" + id); devOK(el, s.ok);
       const off = s.output === false || s.output === "OFF";   // bb3a/bb3b: bool, kel: String
       el.querySelector(".r2").style.display = "";
       // KEL103: mode (CC/CV/CW) in place of "A" (2nd row), but empty when OFF;
@@ -294,8 +498,12 @@
       // Offline (ok:false) => "—" (takes precedence over "Off": offline != "definitely off").
       el.querySelector(".val.v").innerHTML = !s.ok ? dashHtml : (off ? offHtml : valHtml({ sign: "", num: fmt3(s.voltage), unit: "V" }));
       el.querySelector(".val.a").innerHTML = !s.ok ? dashHtml : (off ? offHtml : valHtml({ sign: "", num: fmt3(s.current), unit: "A" }));
+      if (id === "bb3a") {
+        el.querySelector(".lab").textContent = "BB3 Ch" + bb3Ch + " PSU" + (s.disconnected ? "  disconnected" : "");
+      }
+      if (id === "kel") el.querySelector(".lab").textContent = "KEL103" + (s.disconnected ? "  disconnected" : "");
       if (id === "bb3b") {
-        const ex = (s.ok && s.protocol && s.protocol !== "—") ? "  " + s.protocol : "";
+        const ex = s.disconnected ? "  disconnected" : (s.ok && s.protocol && s.protocol !== "—") ? "  " + s.protocol : "";
         el.querySelector(".lab").textContent = "USB" + ex;
         el.querySelector(".mode").textContent = "V";
         const d2 = (v) => (v == null || !isFinite(v)) ? "—" : v.toFixed(2);
@@ -306,8 +514,9 @@
       }
       const g = GRAPHS[id];
       if (g) {
-        if (!off && s.ok && isFinite(s.voltage)) g.append(0, Date.now(), s.voltage);
-        if (!off && s.ok && isFinite(s.current)) g.append(1, Date.now(), s.current);
+        const live = !off && s.ok;
+        if (live && isFinite(s.voltage)) g.append(0, Date.now(), s.voltage); else g.appendGap(0, Date.now());
+        if (live && isFinite(s.current)) g.append(1, Date.now(), s.current); else g.appendGap(1, Date.now());
       }
     }
     if (d.lcr) {
@@ -338,6 +547,7 @@
       el.querySelector(".lab").textContent = "DER EE DE-5000  " + ex;
       const g = GRAPHS.lcr;
       if (g && s.ok && s.value != null && isFinite(s.value)) {
+        g.units = [s.unit || ""];       // base unit; fmtAxis adds the prefix
         g.append(0, Date.now(), s.value);
         g.minValue = 0; g.maxValue = lcrYMax(s.value);
       }
@@ -450,7 +660,7 @@
       requestAnimationFrame(chk);
     });
   }
-  async function startCam(id, attempt) {
+  async function startCam(id, attempt, retried) {
     attempt = attempt || 0;
     if (curStream) curStream.getTracks().forEach(t => t.stop());
     const vc = Object.assign({}, CAM_RES[Math.min(attempt, CAM_RES.length - 1)]);
@@ -462,12 +672,25 @@
       // Verify frames are actually flowing; if not (USB bandwidth), retry at lower resolution.
       const ok = await framesFlowing(1800);
       if (!ok && attempt < CAM_RES.length - 1) {
-        setStatus("Camera retry …"); return startCam(id, attempt + 1);
+        setStatus("Camera retry …"); return startCam(id, attempt + 1, retried);
       }
+      // Even the lowest step delivers nothing -> prefer the server stream to a black image.
+      if (!ok) { setStatus("Camera delivers no frames — server stream"); startServerStream(); return; }
       setStatus("");
     } catch (e) {
-      if (attempt < CAM_RES.length - 1) { return startCam(id, attempt + 1); }
-      setStatus("Camera start: " + e.name);
+      if (attempt < CAM_RES.length - 1) { return startCam(id, attempt + 1, retried); }
+      // On reload the PREVIOUS page instance releases the camera only after a short delay,
+      // so getUserMedia fails with NotReadableError/AbortError. Wait briefly once and try
+      // again; this is exactly the "black after reload" case.
+      if (!retried && (e.name === "NotReadableError" || e.name === "AbortError")) {
+        setStatus("Camera still busy — retrying …");
+        await new Promise(r => setTimeout(r, 1200));
+        return startCam(id, 0, true);
+      }
+      // Last resort: the labcam-micro service opens the same camera by USB ID and delivers
+      // it as MJPEG. An image through the service beats a black viewport.
+      setStatus("Camera start: " + e.name + " — server stream");
+      startServerStream();
     }
   }
 

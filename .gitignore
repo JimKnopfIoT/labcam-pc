@@ -2,6 +2,9 @@
 .env
 *.key
 
+# Runtime state of the instruments backend
+device_connections.json*
+
 # Python
 __pycache__/
 *.py[cod]

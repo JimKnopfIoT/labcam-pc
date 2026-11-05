@@ -62,9 +62,43 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(f"DMM proxy error: {e}".encode())
 
+    def end_headers(self):
+        # NEVER cache local files: otherwise the browser keeps the old version after an
+        # app.js edit and changes do not arrive. The DMM proxy sets its own headers.
+        if not self._is_dmm():
+            self.send_header("Cache-Control", "no-store, must-revalidate")
+        super().end_headers()
+
+    # index.html is rewritten when served: app.js/config.js/style.css get the file time
+    # as ?v=... . An old browser cache entry is therefore invalid after every edit
+    # (a URL it has never loaded), without a hard reload.
+    _VERSIONED = ("app.js", "config.js", "style.css")
+
+    def _serve_index(self):
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html"),
+                      "rb") as fh:
+                html = fh.read().decode("utf-8")
+        except OSError:
+            return super().do_GET()
+        for name in self._VERSIONED:
+            try:
+                v = int(os.path.getmtime(name))
+            except OSError:
+                continue
+            html = html.replace('"%s"' % name, '"%s?v=%d"' % (name, v))
+        data = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         if self._is_dmm():
             return self._proxy("GET")
+        if self.path.split("?", 1)[0] in ("/", "/index.html"):
+            return self._serve_index()
         return super().do_GET()
 
     def do_POST(self):
