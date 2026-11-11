@@ -219,7 +219,7 @@ cd web && ./serve.sh               # http://127.0.0.1:8080/
 
 ---
 
-AI assisted development
+LLM assisted development
 
 ## License
 
