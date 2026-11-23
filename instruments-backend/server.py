@@ -16,6 +16,7 @@ import copy
 import json
 import logging
 import os
+import queue
 import re
 import socket
 import struct
@@ -51,7 +52,9 @@ from config import (
     RECONNECT_BACKOFF, TCP_BUSY_BACKOFF, C1_RECONNECT_BACKOFF,
     DE5000_SOURCE_DEFAULT, DE5000_BAUD, DE5000_SERIAL_PORT,
     DE5000_RN4871_MAC, DE5000_RN4871_NAME, DE5000_TX_UUID,
+    JBC_SERIAL_PORT, JBC_PERIOD, JBC_ALLOW_WRITE, JBC_CONTROL, JBC_CONTROL_HOLD,
 )
+import jbc_dme
 
 # DMM7510 :SENS:FUNC? response → (UI label, unit)
 DMM_MODE_MAP = {
@@ -101,6 +104,7 @@ STATE = {
         "lcr":      {"ok": False, "source": DE5000_SOURCE_DEFAULT, "status": "—",
                      "mode": "—", "value": None, "unit": "",
                      "sec_mode": "", "sec_value": None, "sec_unit": "", "freq": None},
+        "jbc":      {"ok": False, "model": "", "sw": "", "hw": "", "port": "", "ports": []},
     },
 }
 CLIENTS: set = set()
@@ -628,6 +632,113 @@ async def _kel_session():
         await asyncio.sleep(KEL_PERIOD)
 
 
+# ---------- JBC DME-2A soldering station (USB-B, STM32 VCP) ----------
+# Protocol in jbc_dme.py (from https://github.com/JimKnopfIoT/jbc-dme-monitor, see its
+# PROTOCOL.md). Reads all four ports; with JBC_ALLOW_WRITE also writes: the temperature levels (CMD 52, "jbc_level") and the settings of the station
+# menu ("jbc_apply"); reading the settings: "jbc_settings". All queued by _handle_cmd and
+# executed in the session's worker thread between two polls. Settings are published in
+# STATE as jbc.settings with a counter jbc.settings_id, so a client sees its answer.
+JBC_CMDS = queue.Queue()
+JBC_NOTICE = {"id": 0, "ok": True, "text": ""}
+JBC_SETTINGS = {"id": 0, "data": None, "busy": False}
+JBC_FEATURES = ["levels", "settings"]
+
+
+def _jbc_publish_settings(data):
+    JBC_SETTINGS.update(id=JBC_SETTINGS["id"] + 1, data=data)
+
+
+def _jbc_notice(ok, text):
+    log("jbc", text)
+    JBC_NOTICE.update(id=JBC_NOTICE["id"] + 1, ok=ok, text=text)
+
+
+def _jbc_do_cmds(dme):
+    while True:
+        try:
+            item = JBC_CMDS.get_nowait()
+        except queue.Empty:
+            return
+        kind, t0, args = item[0], item[1], item[2:]
+        if time.monotonic() - t0 > 5.0:          # stale (e.g. queued during a reconnect)
+            continue
+        if kind == "settings":
+            try:
+                _jbc_publish_settings(dme.read_settings())
+            except (ValueError, jbc_dme.StationError) as e:
+                _jbc_publish_settings(None)
+                _jbc_notice(False, f"Settings: {e}")
+            continue
+        if kind == "apply":
+            JBC_SETTINGS["busy"] = True
+            STATE["devices"]["jbc"]["settings_busy"] = True
+            try:
+                back, done, errors = dme.apply_settings(args[0])
+                _jbc_publish_settings(back)
+                if errors:
+                    _jbc_notice(False, "; ".join(errors))
+                else:
+                    _jbc_notice(True, f"{len(done)} setting(s) written" if done
+                                else "nothing to write")
+            except (ValueError, TypeError, KeyError, jbc_dme.StationError) as e:
+                _jbc_notice(False, f"Settings: {e}")
+                try:
+                    _jbc_publish_settings(dme.read_settings())
+                except jbc_dme.StationError:
+                    _jbc_publish_settings(None)
+                if dme.fd is None:               # lost the station: let the session reconnect
+                    raise
+            finally:
+                JBC_SETTINGS["busy"] = False
+                STATE["devices"]["jbc"]["settings_busy"] = False
+            continue
+        p, lvl, temp = args
+        try:
+            if temp is None:
+                dme.select_level(p, lvl)
+                text = f"P{p + 1}: level {lvl + 1} active"
+            else:
+                c = dme.set_level_temp(p, lvl, temp)
+                text = f"P{p + 1}: level {lvl + 1} = {c} °C"
+            ok = True
+        except (ValueError, jbc_dme.StationError) as e:
+            ok, text = False, f"P{p + 1}: {e}"
+        _jbc_notice(ok, text)
+
+
+def _jbc_cycle(dme):
+    _jbc_do_cmds(dme)
+    return dme.read_all()
+
+
+async def _jbc_session():
+    loop = asyncio.get_event_loop()
+    while True:
+        dme = jbc_dme.DME(JBC_SERIAL_PORT, allow_write=JBC_ALLOW_WRITE, control=JBC_CONTROL,
+                          control_hold=JBC_CONTROL_HOLD)
+        try:
+            info = await loop.run_in_executor(None, dme.connect)
+            log("jbc", f"connected: {info.get('model')} SW {info.get('sw')} on {info.get('port')}"
+                       f" (write={'on' if JBC_ALLOW_WRITE else 'off'})")
+            while True:
+                ports = await loop.run_in_executor(None, _jbc_cycle, dme)
+                STATE["devices"]["jbc"] = {"ok": True, **info, "ports": ports,
+                                           "writable": JBC_ALLOW_WRITE, "notice": dict(JBC_NOTICE),
+                                           "features": JBC_FEATURES,
+                                           "settings_id": JBC_SETTINGS["id"],
+                                           "settings": JBC_SETTINGS["data"],
+                                           "settings_busy": JBC_SETTINGS["busy"]}
+                await asyncio.sleep(JBC_PERIOD)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            STATE["devices"]["jbc"]["ok"] = False
+            log("jbc", f"error: {type(e).__name__}: {e}")
+        finally:
+            dme.close()
+        await asyncio.sleep(RECONNECT_BACKOFF)
+
+
 # ---------- DER EE DE-5000 LCR meter (CP2102 serial OR RN4871 BLE) ----------
 # 17-byte packet: header 0x00 0x0D, footer 0x0D 0x0A. The byte stream is identical
 # on both transports — the RN4871 only tunnels the meter's UART over BLE Transparent
@@ -830,6 +941,7 @@ DEVICES = {
     "bb3": {"session": _bb3_session, "keys": ("bb3a", "bb3b_raw")},
     "usb": {"session": _c1_session,  "keys": ("bb3b",), "release": _c1_force_disconnect},
     "kel": {"session": _kel_session, "keys": ("kel",)},
+    "jbc": {"session": _jbc_session, "keys": ("jbc",)},
 }
 # Which devices are disconnected survives a restart: the user may be working at the
 # instrument, and a reboot must not put it back into remote mode.
@@ -908,6 +1020,23 @@ def _handle_cmd(msg):
             log(obj["device"], f"disconnected={off} (client request)")
             _save_disconnected()
             dev["wake"].set()
+    # JBC temperature levels: {"cmd": "jbc_level", "port": 0..3, "level": 0..2[, "temp": °C]}
+    # without "temp" = make the level active, with "temp" = set that level's temperature.
+    if obj.get("cmd") == "jbc_level" and JBC_ALLOW_WRITE and not DEVICES["jbc"]["off"]:
+        p, lvl, temp = obj.get("port"), obj.get("level"), obj.get("temp")
+        num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+        if (isinstance(p, int) and 0 <= p < 4 and isinstance(lvl, int) and 0 <= lvl < 3
+                and (temp is None or num(temp))):
+            JBC_CMDS.put(("level", time.monotonic(), p, lvl, None if temp is None else int(round(temp))))
+    # JBC settings: {"cmd": "jbc_settings"} reads them, {"cmd": "jbc_apply", "settings": {...}}
+    # writes every difference (the dict as published in jbc.settings, edited) and reads back.
+    if obj.get("cmd") == "jbc_settings" and not DEVICES["jbc"]["off"]:
+        JBC_CMDS.put(("settings", time.monotonic()))
+    if (obj.get("cmd") == "jbc_apply" and JBC_ALLOW_WRITE and not DEVICES["jbc"]["off"]
+            and isinstance(obj.get("settings"), dict)
+            and isinstance(obj["settings"].get("station"), dict)
+            and isinstance(obj["settings"].get("ports"), list)):
+        JBC_CMDS.put(("apply", time.monotonic(), obj["settings"]))
     if obj.get("cmd") == "lcr_source":
         val = obj.get("value")
         if val == "toggle":

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JBC DME-2A Monitor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2312161d'/%3E%3Cpath d='M14 46 L34 26' stroke='%23ff8a00' stroke-width='6' stroke-linecap='round'/%3E%3Cpath d='M34 26 L46 14' stroke='%23e0e0e0' stroke-width='3' stroke-linecap='round'/%3E%3Ccircle cx='48' cy='44' r='7' fill='none' stroke='%2319d2ff' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="jbc.css">
+</head>
+<body>
+  <div id="glow"></div>
+  <header id="head">
+    <div id="led" title="Double-click: disconnect / connect station"><i></i></div>
+    <div id="conn">
+      <div id="connState">OFFLINE</div>
+      <div id="connInfo">waiting for backend …</div>
+      <div id="connPort"></div>
+    </div>
+    <div class="spacer"></div>
+    <div id="brand">
+      <div id="title">JBC DME-2A</div>
+      <div id="sub"><span class="pill cyan" id="mode">READ ONLY</span><span id="clock"></span></div>
+    </div>
+  </header>
+  <main id="grid"></main>
+  <div id="toast"></div>
+  <footer id="foot">
+    <span>History 3 min · polling 2×/s · double-click a level = active · Ctrl+Shift+wheel on the active level = ±5 °C · double-click the LED disconnects/connects</span>
+    <span class="spacer"></span>
+    <span class="leg"><i class="work"></i>WORKING</span>
+    <span class="leg"><i class="stand"></i>STAND</span>
+    <span class="leg"><i class="sleep"></i>SLEEP</span>
+    <span class="leg"><i class="hiber"></i>HIBERNATION</span>
+  </footer>
+  <script src="config.js"></script>
+  <script src="jbc.js"></script>
+</body>
+</html>

@@ -33,6 +33,10 @@ html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000;
 #idpanel button:hover:not(:disabled) { background: rgba(58,58,58,0.6); }
 #idpanel button:disabled { cursor: default; }   /* same transparency as active buttons (not extra faded) */
 #idpanel button.on { outline: 2px solid var(--v); }   /* active only: blue border */
+/* 🌡 in high-temperature range: orange inner border + "450" */
+#idpanel button.hi { position: relative; box-shadow: inset 0 0 0 2px #ff8a00; }
+#idpanel button.hi::after { content: "450"; position: absolute; right: 2px; bottom: 0;
+  font: 700 8px/1 "Roboto Mono", monospace; color: #ff8a00; }
 #idpanel .lab { grid-column: 1 / -1; }   /* status row spanning full width */
 #idpanel .lab:empty { display: none; }   /* empty -> row+gap removed: idpanel = instrument panel height, buttons 4px top/bottom */
 #status { color: #cfe9ff; font-size: 11px; font-weight: 400; }
@@ -108,7 +112,7 @@ html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000;
    Gradient on/off only changes the bar drawn in the image, never the geometry -> no jitter. */
 #irwrap { position: absolute; right: 13px; z-index: 8;   /* left edge = start of 2nd instrument panel (BB3) */
   bottom: calc(2px + var(--scope-w) * 600 / 1024 * 1px + 6px);   /* = native scope height (1024:600) + gap */
-  width: calc(var(--scope-w) * 1px); aspect-ratio: 768 / 576;   /* 4:3, feste Box */
+  width: calc(var(--scope-w) * 1px); aspect-ratio: 768 / 576;   /* 4:3, fixed box */
   overflow: hidden; background: #000; box-shadow: 0 0 0 1px #555; display: none; }
 #irwrap.show { display: block; }
 #irframe { width: 100%; height: 100%; display: block; object-fit: fill; }
@@ -147,6 +151,22 @@ html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000;
   width: calc(var(--scope-w) * 1px); aspect-ratio: var(--dmm-cw) / var(--dmm-ch);
   overflow: hidden; background: #000; box-shadow: 0 0 0 1px #555; display: none; }
 #dmmwrap.show { display: block; }
+
+/* JBC DME-2A (jbc.html?embed=1) — same slot/width as scope/DMM, its own page in the iframe. */
+#jbcwrap { position: absolute; right: 13px; bottom: 2px; z-index: 8;
+  width: calc(var(--scope-w) * 1px); aspect-ratio: 1024 / 600;   /* like the scope -> fits with IR above it */
+  overflow: hidden; border-radius: 8px; box-shadow: 0 0 0 1px #555; display: none; }
+#jbcwrap.show { display: block; }
+#jbcframe { width: 100%; height: 100%; border: 0; display: block; background: transparent; }
+
+/* JBC panel in the instrument bar: 4 ports, compact. Full view via double-click on 📈/📟 */
+#p-jbc { pointer-events: auto; }
+#p-jbc .jr { display: flex; gap: 6px; align-items: baseline; font-size: 12px; line-height: 15px; white-space: nowrap; }
+#p-jbc .jr .pn { color: var(--label); font-weight: 700; }
+#p-jbc .jr .tl { color: #cfcfcf; min-width: 3.6em; overflow: hidden; text-overflow: ellipsis; }
+#p-jbc .jr .tt { font-weight: 700; margin-left: auto; min-width: 2.6em; text-align: right; }
+#p-jbc .jr .ts { color: #9a9a9a; min-width: 3.1em; text-align: right; }
+#p-jbc .jr .dot { width: 7px; height: 7px; border-radius: 50%; align-self: center; background: #555; flex: none; }
 #dmmframe { position: absolute; left: 0; top: 0; width: 1090px; height: 450px; border: 0;
   transform-origin: top left;
   transform: translate(calc(-1 * var(--dmm-cl) * var(--scope-w) / var(--dmm-cw)),

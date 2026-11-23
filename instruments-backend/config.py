@@ -36,6 +36,15 @@ RECONNECT_BACKOFF    = 2.0
 TCP_BUSY_BACKOFF     = 8.0   # longer when the device still holds the old TCP session
 C1_RECONNECT_BACKOFF = 5.0
 
+# ---------- JBC DME-2A soldering station (USB-B) ----------
+# STM32 virtual COM port 0483:5740. None = automatic (/dev/serial/by-id/*STMicro*Virtual*,
+# otherwise the first /dev/ttyACM*), or fixed, e.g. "/dev/ttyACM0".
+JBC_SERIAL_PORT = None
+JBC_PERIOD      = 0.5    # 2 Hz, one cycle reads all 4 ports
+JBC_ALLOW_WRITE = True   # allow clients to change temperature levels and settings
+JBC_CONTROL     = True   # write like JBC's software: 225 ":C", write, 225 ":M" (the station NACKs otherwise)
+JBC_CONTROL_HOLD = 10.0  # s to stay in ":C" after a write, so the station's front panel notices and reloads
+
 # ---------- DER EE DE-5000 LCR meter ----------
 # Default source is the wired CP2102. Switching to RN4871 (BLE) happens ONLY on a
 # click in the frontend -- otherwise BLE is never scanned (saves power/time).

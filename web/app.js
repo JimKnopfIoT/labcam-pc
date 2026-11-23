@@ -31,6 +31,7 @@
   const irFrame = $("irframe"), irWrap = $("irwrap"), btnIr = $("btnIr"), idpanel = $("idpanel");
   const btnMarkers = $("btnMarkers"), btnGradient = $("btnGradient"), btnDmm = $("btnDmm");
   const dmmFrame = $("dmmframe"), dmmWrap = $("dmmwrap");
+  const jbcFrame = $("jbcframe"), jbcWrap = $("jbcwrap");
   const setStatus = (t) => { statusEl.textContent = t || ""; };
 
   // ---- State ----
@@ -445,10 +446,56 @@
     applyBb3Scale();   // apply the remembered channel (localStorage) to the new graph instance
     sizeGraphs();
   }
+  // ---- JBC DME-2A: compact panel (4 ports). Appears only once the backend delivers the
+  //      key "jbc". Click = full view (jbc.html) as picture-in-picture on/off,
+  //      double-click on the name = disconnect/connect station (like the others). ----
+  const JBC_STATE_COL = { work: "#ff8a00", stand: "#ffb44a", sleep: "#b58cff", hiber: "#19d2ff", error: "#ff5a52" };
+  function jbcTempCol(t, set) {
+    if (t == null) return "#777";
+    if (set && t > set + 25) return "#ff5a52";
+    return t < 60 ? "#19d2ff" : t < 150 ? "#31e0a0" : t < 250 ? "#ffb44a" : "#ff8a00";
+  }
+  function buildJbcPanel() {
+    const el = document.createElement("div");
+    el.className = "panel off"; el.id = "p-jbc"; el.style.display = "none";
+    el.title = "Full view: double-click 📈 or 📟";
+    el.innerHTML = [0, 1, 2, 3].map(i =>
+      `<div class="jr"><span class="dot"></span><span class="pn">P${i + 1}</span><span class="tl">—</span>` +
+      `<span class="tt">—</span><span class="ts"></span></div>`).join("") +
+      '<div class="lab">JBC DME-2A</div>';
+    bar.appendChild(el);
+    const lab = el.querySelector(".lab");
+    lab.style.cursor = "pointer"; lab.style.userSelect = "none";
+    lab.title = "Double-click: disconnect / reconnect station";
+    lab.addEventListener("dblclick", (ev) => {
+      ev.stopPropagation();
+      const cur = lastState && lastState.devices && lastState.devices.jbc;
+      if (cur) sendCmd({ cmd: "device_connection", device: "jbc", connected: !!cur.disconnected });
+    });
+  }
+  function renderJbc(s) {
+    const el = $("p-jbc");
+    if (!el) return;
+    el.style.display = s ? "" : "none";
+    if (!s) return;
+    devOK(el, s.ok);
+    el.querySelector(".lab").textContent = "JBC DME-2A" + (s.disconnected ? "  disconnected" : "");
+    el.querySelectorAll(".jr").forEach((row, i) => {
+      const p = s.ok && s.ports ? s.ports[i] : null;
+      const has = p && p.tool_id;
+      row.querySelector(".dot").style.background = has ? (JBC_STATE_COL[p.state] || "#555") : "#555";
+      row.querySelector(".tl").textContent = has ? p.tool : "—";
+      const tt = row.querySelector(".tt");
+      tt.textContent = has && p.temp != null ? Math.round(p.temp) + "°" : "—";
+      tt.style.color = has ? jbcTempCol(p.temp, p.set) : "#777";
+      row.querySelector(".ts").textContent = has && p.set != null ? "/" + Math.round(p.set) : "";
+    });
+  }
   function devOK(el, ok) { el.classList.toggle("off", !ok); }
   function valHtml(f) { return f.num ? `${f.sign}${f.num}<span class="u"> ${f.unit}</span>` : `<span class="u">${f.unit}</span>`; }
   function renderState(state) {
     lastState = state; const d = state.devices || {};
+    renderJbc(d.jbc);
     if (d.dmm) {
       const s = d.dmm, el = $("p-dmm"); devOK(el, s.ok);
       el.querySelector(".mode").textContent = s.mode || "—";
@@ -857,20 +904,32 @@
   //  Stack (bottom->top): IR on -> [most-recent Scope/DMM, IR];  IR off -> [first, second].
   //  Lazy: set src only when shown, clear it when hidden (VNC/VFP session).
   // =====================================================================
+  //  Two secondary slots (buttons 📈 / 📟). Each shows either its own device or the
+  //  JBC soldering station: click = slot on/off, double-click = cycle content.
+  //  secOrder holds slot names ("scope"/"dmm"), slotMode[slot] the content shown.
   let secOrder = [];                               // "scope"/"dmm" in activation order (oldest first)
-  const _shown = { ir: false, scope: false, dmm: false };
-  const _wrap  = { ir: irWrap, scope: scopeWrap, dmm: dmmWrap };
-  const _frame = { ir: irFrame, scope: scopeFrame, dmm: dmmFrame };
-  const _src   = { ir: () => THERMAL_URL, scope: () => SCOPE_URL, dmm: () => DMM_URL };
-  const _empty = { ir: "", scope: "about:blank", dmm: "about:blank" };
+  const SLOT_NATIVE = { scope: "scope", dmm: "dmm" };
+  const slotMode = { scope: "scope", dmm: "dmm" };
+  try {
+    const m = JSON.parse(LS.getItem("slot_mode") || "{}");
+    for (const s of ["scope", "dmm"]) if (m[s] === "jbc" || m[s] === SLOT_NATIVE[s]) slotMode[s] = m[s];
+    if (slotMode.scope === "jbc" && slotMode.dmm === "jbc") slotMode.dmm = "dmm";
+  } catch (e) { /* ignore */ }
+  const _shown = { ir: false, scope: false, dmm: false, jbc: false };
+  const _wrap  = { ir: irWrap, scope: scopeWrap, dmm: dmmWrap, jbc: jbcWrap };
+  const _frame = { ir: irFrame, scope: scopeFrame, dmm: dmmFrame, jbc: jbcFrame };
+  const _src   = { ir: () => THERMAL_URL, scope: () => SCOPE_URL, dmm: () => DMM_URL,
+                   jbc: () => "jbc.html?embed=1" };
+  const _empty = { ir: "", scope: "about:blank", dmm: "about:blank", jbc: "about:blank" };
   function _setSec(d, on) { secOrder = secOrder.filter(x => x !== d); if (on) secOrder.push(d); }
   function layoutSlots() {
     // Determine stack from bottom to top
-    const stack = irOn
-      ? (secOrder.length ? [secOrder[secOrder.length - 1]] : []).concat(["ir"])  // IR on top, most-recent secondary below
+    const slots = irOn
+      ? (secOrder.length ? [secOrder[secOrder.length - 1]] : [])                  // IR on top, most-recent secondary below
       : secOrder.slice(0, 2);                                                     // first at bottom, second on top
+    const stack = slots.map(s => slotMode[s]).concat(irOn ? ["ir"] : []);
     const vis = new Set(stack);
-    for (const d of ["ir", "scope", "dmm"]) {      // hide non-visible + release session
+    for (const d of ["ir", "scope", "dmm", "jbc"]) {   // hide non-visible + release session
       if (!vis.has(d)) {
         _wrap[d].classList.remove("show");
         if (_shown[d]) { _frame[d].src = _empty[d]; _shown[d] = false; }
@@ -880,15 +939,86 @@
       if (!_shown[d]) { _frame[d].src = _src[d](); _shown[d] = true; }
       _wrap[d].classList.add("show");
     }
+    fitSlots(stack);
     let y = 2;                                      // stack from bottom edge up (6 px gap)
     for (const d of stack) { _wrap[d].style.bottom = y + "px"; y += _wrap[d].offsetHeight + 6; }
   }
+  // If the stack no longer fits below the instrument bar (short window), the shared slot
+  // width --scope-w is reduced. All slots scale with this one variable (including the
+  // scope/DMM crops), so aspect ratios are preserved.
+  const SLOT_W_MAX = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--scope-w")) || 678;
+  const SLOT_HPW = { ir: 576 / 768, scope: 600 / 1024, dmm: 336 / 560, jbc: 600 / 1024 };  // height per width
+  function fitSlots(stack) {
+    const top = $("top").getBoundingClientRect().bottom + 8;         // bottom edge of bar/ID panel + margin
+    const avail = window.innerHeight - top - 2 - 6 * Math.max(0, stack.length - 1);
+    const hpw = stack.reduce((a, d) => a + (SLOT_HPW[d] || 0.6), 0);
+    const w = hpw > 0 ? Math.max(320, Math.min(SLOT_W_MAX, Math.floor(avail / hpw))) : SLOT_W_MAX;
+    document.documentElement.style.setProperty("--scope-w", String(w));
+  }
+  window.addEventListener("resize", () => layoutSlots());
   function setIr(on)    { irOn = on;    btnIr.classList.toggle("on", on);    layoutSlots(); }
   function setScope(on) { scopeOn = on; btnScope.classList.toggle("on", on); _setSec("scope", on); layoutSlots(); }
   function setDmm(on)   { dmmOn = on;   btnDmm.classList.toggle("on", on);   _setSec("dmm", on);   layoutSlots(); }
-  btnIr.addEventListener("click", () => setIr(!irOn));
-  btnScope.addEventListener("click", () => setScope(!scopeOn));
-  btnDmm.addEventListener("click", () => setDmm(!dmmOn));
+  // Button label follows the slot content
+  const SLOT_BTN = {
+    scope: { btn: btnScope, icon: { scope: "📈", jbc: "♨" },
+             title: { scope: "Oscilloscope SDS2504X-HD", jbc: "JBC DME-2A soldering station" } },
+    dmm:   { btn: btnDmm,   icon: { dmm: "📟", jbc: "♨" },
+             title: { dmm: "DMM7510 Virtual Front Panel", jbc: "JBC DME-2A soldering station" } },
+  };
+  function slotLabels() {
+    for (const s of ["scope", "dmm"]) {
+      const b = SLOT_BTN[s], m = slotMode[s];
+      b.btn.textContent = b.icon[m];
+      b.btn.title = b.title[m] + " — click: on/off · double-click: " +
+        (m === "jbc" ? b.title[SLOT_NATIVE[s]] : "JBC soldering station") + " view";
+    }
+  }
+  function cycleSlot(s) {
+    const other = s === "scope" ? "dmm" : "scope";
+    slotMode[s] = slotMode[s] === "jbc" ? SLOT_NATIVE[s] : "jbc";
+    // Show the JBC view only once: if the other slot already shows it, that slot gets its device back.
+    if (slotMode[s] === "jbc" && slotMode[other] === "jbc") slotMode[other] = SLOT_NATIVE[other];
+    try { LS.setItem("slot_mode", JSON.stringify(slotMode)); } catch (e) { /* */ }
+    slotLabels();
+    if (s === "scope") setScope(true); else setDmm(true);   // cycling also shows the slot
+  }
+  // Run single click delayed, so a double-click does not first switch the slot off and
+  // back on (that would needlessly rebuild VNC/VFP sessions).
+  function clickOrDbl(btn, onClick, onDbl) {
+    let t = null;
+    btn.addEventListener("click", () => {
+      if (t) return;
+      t = setTimeout(() => { t = null; onClick(); }, 260);
+    });
+    btn.addEventListener("dblclick", () => { clearTimeout(t); t = null; onDbl(); });
+  }
+  slotLabels();
+  // 🌡: click = thermal image on/off, double-click = measuring range normal (-20..120 °C) <-> high (-20..450 °C).
+  // The range is set in the labcam-thermal service (/range?high=0|1, FFC follows automatically);
+  // the button shows the actual state from /emiss (diag.range), not the requested one.
+  let irHigh = null;
+  function showIrRange(high) {
+    irHigh = high;
+    btnIr.classList.toggle("hi", high === true);
+    btnIr.title = "Thermal image HT-301 on/off · double-click: measuring range " +
+      (high ? "high (up to 450 °C) → normal" : "normal (up to 120 °C) → high");
+  }
+  function pollIrRange() {
+    fetch(`${THERMAL_BASE}/emiss`).then(r => r.json())
+      .then(j => showIrRange(j && j.diag ? j.diag.range === "high" : null)).catch(() => {});
+  }
+  function toggleIrRange() {
+    const want = !(irHigh === true);
+    showIrRange(want);                                  // show immediately, poll confirms
+    fetch(`${THERMAL_BASE}/range?high=${want ? 1 : 0}`).catch(() => {});
+    setTimeout(pollIrRange, 1500);
+  }
+  clickOrDbl(btnIr, () => setIr(!irOn), toggleIrRange);
+  pollIrRange();
+  setInterval(pollIrRange, 5000);
+  clickOrDbl(btnScope, () => setScope(!scopeOn), () => cycleSlot("scope"));
+  clickOrDbl(btnDmm,   () => setDmm(!dmmOn),     () => cycleSlot("dmm"));
   // IR markers (Min/Max + measurement points) on/off. Default OFF -> service stays in robust YUYV mode.
   let markersOn = false;
   btnMarkers.addEventListener("click", () => {
@@ -958,6 +1088,7 @@
   video.addEventListener("loadedmetadata", () => { if (compOn && !roi) { roi = defaultRoi(); positionBox(); } draw(); });
 
   buildBar();
+  buildJbcPanel();
   sizeCanvas();
   initCamera();
   stateConnect();

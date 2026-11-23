@@ -3,7 +3,7 @@
 PC-side companion services for **LabCam**, an electronics-lab measurement setup.
 They turn a bench full of instruments and USB cameras into live, network-readable
 data and a browser dashboard, and they back the phone app
-([labcam-phone](../labcam-phone)) and its component-identification feature.
+([labcam-phone](https://github.com/JimKnopfIoT/labcam-phone)) and its component-identification feature.
 
 This repository bundles five small, independent components:
 
@@ -57,8 +57,8 @@ Run it only inside a trusted LAN. Use at your own risk.
 ## Architecture / data flow
 
 ```
-  bench instruments (LAN/BLE)              HT-301 thermal cam (USB)
-        │ SCPI/UDP/BLE                            │ V4L2
+  bench instruments (LAN/BLE/USB)          HT-301 thermal cam (USB)
+        │ SCPI/UDP/BLE/serial                           │ V4L2
         ▼                                         ▼
  instruments-backend  ──ws://host:7891──┐     thermal/  ──:7896 MJPEG──┐
  (JSON STATE, ~5 Hz)                    │                              │
@@ -73,8 +73,10 @@ Run it only inside a trusted LAN. Use at your own risk.
   instruments-backend (:7891) and the same component-id service (:7895).
 ```
 
-Every consumer (web dashboard, phone) is **read-only** against the instruments
-backend; nothing writes back to the instruments through these services.
+The consumers (web dashboard, phone) only read the instruments, with two
+exceptions they ask for explicitly: disconnecting an instrument (see below) and
+the JBC soldering station, whose temperature levels and settings can be changed
+from the dashboard and from iSoSta.
 
 ---
 
@@ -94,13 +96,16 @@ KEL = ("<kel-ip>", 18190)     # electronic load (UDP)
 C1_MAC = "AA:BB:CC:DD:EE:FF"       # USB power tester (BLE) — set your device MAC
 DE5000_SOURCE_DEFAULT = "cp2102"             # LCR meter transport: "cp2102" (wired) | "rn4871" (BLE)
 DE5000_RN4871_MAC     = "AA:BB:CC:DD:EE:FF"  # LCR-over-BLE module MAC (empty = find by advertised name)
+JBC_SERIAL_PORT  = None   # JBC DME-2A on USB: None = auto (STM32 virtual COM port), or "/dev/ttyACM0"
+JBC_ALLOW_WRITE  = True   # clients may change its temperature levels and settings
+JBC_CONTROL_HOLD = 10.0   # s to stay in control mode after a write (front panel follows)
 WS_HOST, WS_PORT = "0.0.0.0", 7891 # WebSocket the clients connect to
 # ... plus polling rates and reconnect backoff
 ```
 
 Replace the example LAN IPs / the placeholder BLE MACs with your own devices and
 restart `server.py`. The JSON STATE schema this produces is documented at the top
-of `server.py` (keys `dmm`, `bb3a`, `bb3b`, `kel`, `lcr`).
+of `server.py` (keys `dmm`, `bb3a`, `bb3b`, `kel`, `lcr`, `jbc`).
 
 **LCR meter (DER EE DE-5000)** — read two ways over the same 9600-baud frame
 format (17-byte frames `00 0D … 0D 0A`): a wired **CP2102** USB-serial IR adapter
@@ -112,11 +117,37 @@ connects directly by MAC (falls back to the advertised-name prefix) and clears a
 stale BLE link before connecting. Note: the RN4871's UART RX needs a pull-up to
 3.3 V — without it the module streams only `0x00` bytes.
 
+**JBC DME-2A soldering station** — connected to the PC with a USB cable on its
+USB-B socket (an STM32 virtual COM port, `0483:5740`, `/dev/ttyACM*`; the user
+running `server.py` needs read/write access to it, e.g. via the `dialout` group).
+The backend reads all four ports at 2 Hz (tool, tip temperature, set point,
+power, state, temperature levels) and publishes them under `jbc`. The protocol
+lives in `instruments-backend/jbc_dme.py`, taken from
+[jbc-dme-monitor](https://github.com/JimKnopfIoT/jbc-dme-monitor), whose `PROTOCOL.md` describes it.
+With `JBC_ALLOW_WRITE` the clients can send
+
+```js
+{"cmd": "jbc_level", "port": 0, "level": 1}               // make level 2 of port 1 active
+{"cmd": "jbc_level", "port": 0, "level": 1, "temp": 350}  // set that level to 350 °C
+{"cmd": "jbc_settings"}                                   // read the station menu settings
+{"cmd": "jbc_apply", "settings": {...}}                   // write every difference, read back
+```
+
+The answers appear in the STATE as `jbc.notice`, `jbc.settings` and
+`jbc.settings_id`. The station accepts writes only in its control mode; the
+backend stays in it for `JBC_CONTROL_HOLD` seconds after a write, because the
+station's front panel notices control mode only then and afterwards shows the
+new values (it shows a "U" meanwhile). The station's front stays usable
+otherwise. The web dashboard shows a compact JBC panel and, on double click on
+📈 or 📟, a full view with level buttons (`web/jbc.html`);
+[iSoSta](https://github.com/JimKnopfIoT/harbour-isosta) is a Sailfish OS app for the station that can use
+this backend.
+
 ### Disconnecting an instrument
 
 A double click on an instrument's name in the dashboard or phone app disconnects it:
 no queries, no open connection, the panel shows `—` and "disconnected". The clients
-send `{"cmd":"device_connection","device":"dmm|bb3|usb|kel","connected":false}` over
+send `{"cmd":"device_connection","device":"dmm|bb3|usb|kel|jbc","connected":false}` over
 the WebSocket. The backend keeps the state in
 `instruments-backend/device_connections.json`, so it survives a restart. The DMM7510
 is handed back to its front panel (`:TRIG:CONT REST`), and it is also released while
@@ -160,8 +191,15 @@ export LABCAM_DMM_AUTH=youruser:yourpass     # default in code is the placeholde
 THERMAL_USB_IDS=<thermal-vid:pid>   # IR camera USB vid:pid (whitelist; find with `lsusb`)
 THERMAL_USB_SERIALS=                # optional serial filter for identical cameras
 THERMAL_PORT=7896
-THERMAL_EMISSIVITY=0.95             # optional
+THERMAL_EMISSIVITY=0.95             # optional; applied host-side to the temperature table
+THERMAL_HIGH_RANGE=0                # 1 = start in the high range (-20..450 °C) instead of -20..120 °C
+THERMAL_FFC_SEC=120                 # shutter calibration (FFC) at least every N s (0 = manual only)
+THERMAL_FFC_DFPA=1.5                # ... and whenever the sensor temperature drifts by N K
 ```
+
+The range can also be switched at run time: `/range?high=1|0` on the thermal
+service, or a double click on 🌡 in the dashboard (the button then shows an
+orange frame and "450"). A FFC follows every switch automatically.
 
 ### Microscope stream → environment variables (for `micro/micro.py`)
 
@@ -219,8 +257,6 @@ cd web && ./serve.sh               # http://127.0.0.1:8080/
 
 ---
 
-LLM assisted development
-
 ## License
 
 * **GPL-3.0-or-later** for this repository — see `LICENSE`.
@@ -241,3 +277,11 @@ PC side: it reads the instruments WebSocket and POSTs ROI crops to the
 component-ID service. The two repos share the JSON STATE schema (documented in
 `instruments-backend/server.py`) and the component card schema (documented in
 `component-id/API.md`).
+
+Other clients and related projects:
+[iSoSta](https://github.com/JimKnopfIoT/harbour-isosta) (JBC DME-2A on Sailfish OS, can connect to this
+backend), [jbc-dme-monitor](https://github.com/JimKnopfIoT/jbc-dme-monitor) (the same station on a Linux
+desktop, and the protocol), [harbour-ircam](https://github.com/JimKnopfIoT/harbour-ircam) (thermal camera
+viewer for Sailfish OS).
+
+LLM assisted development

@@ -39,6 +39,9 @@ class Camera:
     offset_temp_fpa = 0.0
 
     range = 120
+    # Host-side emissivity (None = use the value stored in the camera). Like IRCAM, the
+    # LUT is computed with this value; writing ε to the camera has no visible effect.
+    emissivity_override: float | None = None
     cal_00_offset = 390.0
     cal_00_fpamul = 7.05
     
@@ -126,7 +129,8 @@ class Camera:
         Refltmp = read_f32(self.frame_raw_u16, self.fourLinePara + self.userArea + 2)
         Airtmp = read_f32(self.frame_raw_u16, self.fourLinePara + self.userArea + 4)
         humi = read_f32(self.frame_raw_u16, self.fourLinePara + self.userArea + 6)
-        emiss = read_f32(self.frame_raw_u16, self.fourLinePara + self.userArea + 8) 
+        emiss_cam = read_f32(self.frame_raw_u16, self.fourLinePara + self.userArea + 8)
+        emiss = emiss_cam if self.emissivity_override is None else self.emissivity_override
         distance = read_u16(self.frame_raw_u16, self.fourLinePara + self.userArea + 10)
         
         fpa_avg = read_u16(self.frame_raw_u16, self.fourLinePara)
@@ -179,6 +183,8 @@ class Camera:
             "temp_air": Airtmp,
             "humidity": humi,
             "emissivity": emiss,
+            "emissivity_camera": emiss_cam,
+            "range": self.range,
             "distance": distance,
             "fpa_average": fpa_avg,
             "temp_fpa": fpatmp_,
@@ -364,14 +370,20 @@ class Camera:
     def temperature_range_normal(self):
         """Switch camera to the normal temperature range (-20°C to 120°C)"""
         self.cap.set(cv2.CAP_PROP_ZOOM, 0x8020)
+        self.range = 120
         self.correction_coefficient_m = 1
         self.correction_coefficient_b = 0
 
     def temperature_range_high(self):
-        """Switch camera to the high temperature range (-20°C to 450°C)"""
+        """Switch camera to the high temperature range (-20°C to 450°C).
+
+        As in IRCAM Thermal Viewer (OpenRMH-IRCAM, MIT): the cal_00 correction only
+        applies to the normal range, so range != 120 drops it; no extra linear fit.
+        Caller should wait ~0.5 s and then calibrate() (FFC)."""
         self.cap.set(cv2.CAP_PROP_ZOOM, 0x8021)
-        self.correction_coefficient_m = 1.17
-        self.correction_coefficient_b = -40.9
+        self.range = 450
+        self.correction_coefficient_m = 1
+        self.correction_coefficient_b = 0
 
 
 class MockVidoCapture:
